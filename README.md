@@ -1,6 +1,6 @@
-# Guide: Headless MuJoCo on an NVIDIA GB10 ARM Box — EGL Render, Franka Panda, a Cube, and Why Teleporting IK Puts the Cube Through the Hand
+# Guide: Headless MuJoCo on an NVIDIA DGX Spark (GB10) — EGL Render, Franka Panda, a Cube, and Why Teleporting IK Puts the Cube Through the Hand
 
-**The problem this guide solves**: you have a headless NVIDIA GB10-class ARM box (no usable display), the GPU is free, and you want a **real** physics robot in the loop — not a GUI toy, not a screenshot from a laptop. This guide documents a **verified working** configuration (NVIDIA GB10, 121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12, MuJoCo 3.12.0, mink 1.3.0, August 2026): MuJoCo runs with `MUJOCO_GL=egl`, writes PNGs, drives a Menagerie Franka Panda, and approaches a cube.
+**The problem this guide solves**: you have a headless NVIDIA DGX Spark (no usable display), the GPU is free, and you want a robot **inside a physics engine** (contacts, gravity) — not a GUI puppet, not a screenshot from a laptop, and not a hardware arm. This guide documents a **verified working** configuration (NVIDIA DGX Spark (GB10), 121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12, MuJoCo 3.12.0, mink 1.3.0, August 2026): MuJoCo runs with `MUJOCO_GL=egl`, writes PNGs, drives a Menagerie Franka Panda, and approaches a cube.
 
 It covers why a **side camera hides `joint1`**, why **`mj_forward` after IK** lets the cube occupy the same volume as the hand (the PNG still “grasps”), why **floor contacts are not a grasp**, and why **position-only IK** on `left_finger` touches the palm instead of pinching.
 
@@ -10,7 +10,7 @@ It covers why a **side camera hides `joint1`**, why **`mj_forward` after IK** le
 
 ## 1. Free the GPU, then install MuJoCo in a venv
 
-This box can already hold a ~100 GB LLM (~114 Gi used with a small VL beside it). MuJoCo + JAX will not get a CUDA context worth using in that state. Stop the LLM user units first. Measured after a cold boot with those units **not** enabled: **2.7 Gi used / 119 Gi available**, no `llama-server`, ports `:8000`/`:8001` closed.
+This Spark can already hold a ~100 GB LLM (~114 Gi used with a small VL beside it). MuJoCo + JAX will not get a CUDA context worth using in that state. Switch the box to the **idle** profile first ([idle vs LLM boot profiles](https://github.com/AI-Architect-Lab-333/dgx-spark-idle-llm-profiles)). Measured after a cold boot with those units **not** enabled: **2.7 Gi used / 119 Gi available**, no `llama-server`, ports `:8000`/`:8001` closed.
 
 ```bash
 # on the GPU box, as the inference user
@@ -127,7 +127,7 @@ A green `GRASP_OK` from the teleport script is **not** this section’s pass.
 | Cube through the hand, `GRASP_OK` | `qpos` snap + `mj_forward` | Descend with `mj_step` |
 | `ncon>0` at rest | Cube on the floor | Exclude `floor` geom |
 | Contact then cube stays down | Position-only IK, palm hit | 6-D grasp IK (not verified here) |
-| CUDA OOM / tiny `MemAvailable` | ~100 GB LLM still resident | Stop the LLM user units first |
+| CUDA OOM / tiny `MemAvailable` | ~100 GB LLM still resident | Idle profile ([boot profiles](https://github.com/AI-Architect-Lab-333/dgx-spark-idle-llm-profiles)) |
 | `bash^M` / odd `NameError` after scp from Windows | CRLF | `sed -i 's/\r$//'` on the box |
 
 ---
@@ -148,4 +148,4 @@ A green `GRASP_OK` from the teleport script is **not** this section’s pass.
 MuJoCo is open source ([google-deepmind/mujoco](https://github.com/google-deepmind/mujoco)). Robot XML from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Franka Emika Panda). Differential IK: [mink](https://github.com/kevinzakka/mink). The teleport-vs-`mj_step` failure mode and the side-camera `joint1` miss are specific to this session.
 
 ---
-*Guide written and verified in August 2026 on an NVIDIA GB10-class ARM box (121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12.3, MuJoCo 3.12.0, mink 1.3.0, NVIDIA driver 580.173.02). EGL PNGs only. Collision-aware pinch: GRASP_FAIL. Teleport IK: cube through the hand.*
+*Guide written and verified in August 2026 on an NVIDIA DGX Spark (GB10) (121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12.3, MuJoCo 3.12.0, mink 1.3.0, NVIDIA driver 580.173.02). EGL PNGs only. Collision-aware pinch: GRASP_FAIL. Teleport IK: cube through the hand.*
