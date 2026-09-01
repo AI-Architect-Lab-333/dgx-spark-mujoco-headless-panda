@@ -1,4 +1,4 @@
-<mujoco model="panda cube seance">
+<mujoco model="panda cube">
   <include file="scene.xml"/>
   <worldbody>
     <body name="cube" pos="0.45 0 0.02">

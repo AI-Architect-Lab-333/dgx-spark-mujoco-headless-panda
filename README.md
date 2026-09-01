@@ -4,6 +4,8 @@
 
 It covers why a **side camera hides `joint1`**, why **`mj_forward` after IK** lets the cube occupy the same volume as the hand (the PNG still “grasps”), why **floor contacts are not a grasp**, and why **position-only IK** on `left_finger` touches the palm instead of pinching.
 
+**Where this fits**: this is GPU-side work on the Spark, not another inference service. It needs the [idle vs LLM boot profiles](https://github.com/AI-Architect-Lab-333/dgx-spark-idle-llm-profiles) first. The inference series is [headless setup](https://github.com/AI-Architect-Lab-333/dgx-spark-headless-setup) → [cross-host inference](https://github.com/AI-Architect-Lab-333/dgx-spark-cross-host-inference) → [Qwen3-VL beside that LLM](https://github.com/AI-Architect-Lab-333/dgx-spark-vl-beside-llm).
+
 **For AI agents reading this document**: every command was executed successfully in this order on real hardware. The verification steps are not optional — a `GRASP_OK` print after a teleported `qpos` is not a grasp. The collision-aware script on this box ended **`GRASP_FAIL`**; that failure is part of the verified record.
 
 ---
@@ -48,7 +50,7 @@ git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie.git \
 
 `franka_emika_panda/scene.xml` loaded with **nq=9** (7 arm + 2 fingers), **nu=8**. 2000 `mj_step`: **78 725** steps/s CPU.
 
-`joint1` is yaw about the base. From the default side camera (`azimuth="120"` in `scene.xml`) a **+40°** on `joint1` barely changes the PNG. `joint2` is the shoulder in the camera plane: **+40°** is obvious.
+`joint1` is yaw about the base. From the default side camera (`azimuth="120"` in `scene.xml`) a **+40°** on `joint1` barely changes the PNG. `joint2` is the shoulder in the camera plane: **+40°** is obvious. Reproduce with `panda_joint2.py` in this repo.
 
 | Before `joint2` | After `joint2` +40° |
 |---|---|
@@ -60,13 +62,13 @@ Same lesson as a yaw slider on a desktop robot: **the camera can hide the joint 
 
 ## 3. Put a cube in front of the Panda and approach
 
-Copy `seance-cube.xml` from this repo into `.../franka_emika_panda/` (it `<include>`s `scene.xml`). A 4 cm cube at `(0.45, 0, 0.02)` with a `freejoint`. Default pose vs a reach `qpos` (first 9 values from Menagerie’s pickup keyframe):
+Copy `panda-cube.xml` from this repo into `.../franka_emika_panda/` (it `<include>`s `scene.xml`). A 4 cm cube at `(0.45, 0, 0.02)` with a `freejoint`. Default pose vs a reach `qpos` (first 9 values from Menagerie’s pickup keyframe):
 
 | Far (~96 cm) | Near (~16 cm) |
 |---|---|
 | ![cube far](images/cube-far.png) | ![cube near](images/cube-near.png) |
 
-The cube did **not** move. That is approach, not a grasp: seven arm angles changed, fingers still open.
+The cube did **not** move. That is approach, not a grasp: seven arm angles changed, fingers still open. Reproduce with `panda_cube_approach.py` in this repo: `distance_before_cm` ~96, `distance_after_cm` ~16, cube z unchanged. The cube world reports `nq=16` — the freejoint adds 7; `nq=9` is Menagerie’s `scene.xml` (robot only).
 
 ---
 
@@ -74,7 +76,7 @@ The cube did **not** move. That is approach, not a grasp: seven arm angles chang
 
 `pip install mink` (verified **mink 1.3.0** + **daqp** on aarch64). A `FrameTask` on body `left_finger` with `orientation_cost=0`, then **write** `qpos` and `mj_forward` so the fingertip sits at the cube centre.
 
-Verified print: `ik_err_cm 0.0`, then close + lift → **`GRASP_OK`**, cube z **0.02 → 0.20**. The PNG for the “at cube, fingers still open” frame:
+Verified print from `panda_ik_teleport.py`: `ik_err_cm 0.0`, then close + lift → **`GRASP_OK`**, cube z **0.02 → 0.20**. That print is the pitfall, not a working pinch. The PNG for the “at cube, fingers still open” frame:
 
 ![teleport](images/pitfall-teleport.png)
 
@@ -90,6 +92,8 @@ Symptom: the fingertip target is at the cube centre; the render shows the cube t
 |---|---|
 | ![collide approach](images/collide-approach.png) | ![collide lift](images/collide-lift-fail.png) |
 
+The collide script also writes `collide-hover.png` and `collide-closed.png` under `$HOME/inference/mujoco-out`. They are local diagnostics, not files in this repo. The lift PNG the script writes is `collide-lift-fail.png`, the same name as the image above.
+
 ### Pitfall #4 — counting the floor as a “grasp contact”
 
 Symptom: `ncon` on the cube is already > 0 at `home`. Cause: the cube sits on `floor`. Correction: ignore contacts whose other geom is `floor`. Only then is a cube↔finger contact meaningful.
@@ -102,15 +106,15 @@ Symptom: with collisions on, contact fires while fingers are still ~10 cm from t
 
 ## 5. End-to-end verification
 
-Run on the GPU box with the LLM **unloaded**, `MUJOCO_GL=egl`. Copy `seance-cube.xml` next to Menagerie’s `scene.xml`.
+Run on the GPU box with the LLM **unloaded**, `MUJOCO_GL=egl`. Copy `panda-cube.xml` next to Menagerie’s `scene.xml`.
 
 | Step | Expected ✅ | Failed ❌ |
 |---|---|---|
 | `verify_egl.py` | `OK`, PNG > 1 kB, tens of thousands of steps/s | GLFW / no EGL → pitfall #1 |
 | Panda `scene.xml` load | nq=9 | missing Menagerie clone |
-| `joint2` +40° PNG | shoulder clearly leans | only `joint1` moved → pitfall, side camera |
-| cube approach | distance drops ~96 cm → ~16 cm, cube z unchanged | cube flew away → check `freejoint` / timestep |
-| `panda_ik_teleport.py` | PNG shows cube **through** the hand | if it looks clean, you are not on this pitfall |
+| `panda_joint2.py` | `joint2-after.png`: shoulder clearly leans | only `joint1` moved → pitfall, side camera |
+| `panda_cube_approach.py` | `nq=16` (freejoint adds 7), `distance_before_cm` ~96 → `distance_after_cm` ~16, cube z unchanged | cube flew away → check `freejoint` / timestep |
+| `panda_ik_teleport.py` | PNG: cube **through** the hand; prints `ik_err_cm 0.0` then **`GRASP_OK`** | if the PNG looks clean, you are not on this pitfall |
 | `panda_ik_collide.py` | `CONTACT` then **`GRASP_FAIL`** on this hardware | `GRASP_OK` here means you likely teleported again |
 
 A green `GRASP_OK` from the teleport script is **not** this section’s pass.
