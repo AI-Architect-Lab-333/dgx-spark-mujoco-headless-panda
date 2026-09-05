@@ -1,12 +1,12 @@
 # Guide: Headless MuJoCo on an NVIDIA DGX Spark (GB10) — EGL Render, Franka Panda, a Cube, and Why Teleporting IK Puts the Cube Through the Hand
 
-**The problem this guide solves**: you have a headless NVIDIA DGX Spark (no usable display), the GPU is free, and you want a robot **inside a physics engine** (contacts, gravity) — not a GUI puppet, not a screenshot from a laptop, and not a hardware arm. This guide documents a **verified working** configuration (NVIDIA DGX Spark (GB10), 121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12, MuJoCo 3.12.0, mink 1.3.0, August 2026): MuJoCo runs with `MUJOCO_GL=egl`, writes PNGs, drives a Menagerie Franka Panda, and approaches a cube.
+**The problem this guide solves**: you have a headless NVIDIA DGX Spark (no usable display), the GPU is free, and you want a robot **inside a physics engine** (contacts, gravity) — not a GUI puppet, not a screenshot from a laptop, and not a hardware arm. This guide documents a **verified working** configuration (NVIDIA DGX Spark (GB10), 121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12, MuJoCo 3.12.0, mink 1.3.0, August–September 2026): MuJoCo runs with `MUJOCO_GL=egl`, writes PNGs, drives a Menagerie Franka Panda, and approaches a cube.
 
-It covers why a **side camera hides `joint1`**, why **`mj_forward` after IK** lets the cube occupy the same volume as the hand (the PNG still “grasps”), why **floor contacts are not a grasp**, and why **position-only IK** on `left_finger` touches the palm instead of pinching.
+It covers why a **side camera hides `joint1`**, why **`mj_forward` after IK** lets the cube occupy the same volume as the hand (the PNG still “grasps”), why **floor contacts are not a grasp**, why **position-only IK** on `left_finger` hits the palm, and why a **6-D pinch** that then commands the gripper to 0 **tosses** the cube (a green `GRASP_OK` with `ncon=0`).
 
 **Where this fits**: this is GPU-side work on the Spark, not another inference service. It needs the [idle vs LLM boot profiles](https://github.com/AI-Architect-Lab-333/dgx-spark-idle-llm-profiles) first. The inference series is [headless setup](https://github.com/AI-Architect-Lab-333/dgx-spark-headless-setup) → [cross-host inference](https://github.com/AI-Architect-Lab-333/dgx-spark-cross-host-inference) → [Qwen3-VL beside that LLM](https://github.com/AI-Architect-Lab-333/dgx-spark-vl-beside-llm).
 
-**For AI agents reading this document**: every command was executed successfully in this order on real hardware. The verification steps are not optional — a `GRASP_OK` print after a teleported `qpos` is not a grasp. The collision-aware script on this box ended **`GRASP_FAIL`**; that failure is part of the verified record.
+**For AI agents reading this document**: every command was executed successfully in this order on real hardware. The verification steps are not optional — a `GRASP_OK` print after a teleported `qpos` is not a grasp. The position-only collide script on this box ended **`GRASP_FAIL`**. The 6-D script ended **`GRASP_OK`** with the cube still in the fingers; a tossed-cube `GRASP_OK` is documented as a pitfall.
 
 ---
 
@@ -100,11 +100,31 @@ Symptom: `ncon` on the cube is already > 0 at `home`. Cause: the cube sits on `f
 
 ### Pitfall #5 — position-only IK pinches the air beside the palm
 
-Symptom: with collisions on, contact fires while fingers are still ~10 cm from the cube centre; closing does not trap the cube. Cause: `FrameTask(..., orientation_cost=0)` on `left_finger` **body** origin, not a grasp site with palm-down orientation. The hand **side** meets the cube first. A 6-D IK (position + finger axis) was **not** completed on this box.
+Symptom: with collisions on, contact fires while fingers are still ~10 cm from the cube centre; closing does not trap the cube. Cause: `FrameTask(..., orientation_cost=0)` on `left_finger` **body** origin, not a grasp site with palm-down orientation. The hand **side** meets the cube first. Correction: 6-D IK on the `hand` frame (next section).
 
 ---
 
-## 5. End-to-end verification
+## 5. 6-D IK: palm down, then a collision-aware pinch
+
+`panda_ik_6d.py` drives the **hand** body with `position_cost=1` and `orientation_cost=1`. The grasp TCP is the fingertip-pad centre in the hand frame `(0, 0, 0.1029)`. Approach axis is world `-Z`, closing axis is world `+Y`. Hover still snaps the **arm** in free space; every later motion is `ctrl` + `mj_step`.
+
+Verified on this box, twice (identical prints): hover `ori_err_deg` **0.4**; descend to the cube with **`NO_CONTACT`**; both finger pads meet the cube Y-faces (`y=±0.02`) at `finger_q` **0.02**; lift cube z **0.02 → 0.172** with **6** cube↔finger contacts still on. `tcp_to_cube_cm` **2.2**. `impratio=10`.
+
+| Hover (open, palm down) | Closed pinch on the floor | Lift, cube still in the fingers |
+|---|---|---|
+| ![ik6d hover](images/ik6d-hover.png) | ![ik6d closed](images/ik6d-closed.png) | ![ik6d lift](images/ik6d-lift-ok.png) |
+
+The script also writes `ik6d-approach.png`, `ik6d-closed-side.png` and `ik6d-lift-ok-side.png` (azimuth 90) under `$HOME/inference/mujoco-out`. The side frames are in `images/` here.
+
+### Pitfall #6 — `cube_z > 0.08` after a shove is not a grasp
+
+Symptom: the first 6-D run printed **`GRASP_OK`** with `ncon_cube=0` and `tcp_to_cube_cm` 8.4. The PNG showed the cube in mid-air **beside** an empty gripper. Cause: after contact, `ctrl[7]` kept going to **0**; the fingers met and **tossed** the cube. Correction: freeze the gripper command as soon as **left and right** pads both see the cube, and require `ncon>0` and TCP within 5 cm as well as cube height. Reproduce: command `255→0` after the pinch, then lift.
+
+### Pitfall #7 — pads on the near edge lever the cube out
+
+Symptom: pads sat at world `x≈0.442` while the cube centre is `0.45`; lift slipped even with a two-finger contact. Cause: ~4 mm IK residual plus a TCP aimed at the geometric centre, so the pads gripped the **−X** rim. Correction: aim the TCP at `cube + (0.01, 0, 0)`.
+
+## 6. End-to-end verification
 
 Run on the GPU box with the LLM **unloaded**, `MUJOCO_GL=egl`. Copy `panda-cube.xml` next to Menagerie’s `scene.xml`.
 
@@ -116,8 +136,9 @@ Run on the GPU box with the LLM **unloaded**, `MUJOCO_GL=egl`. Copy `panda-cube.
 | `panda_cube_approach.py` | `nq=16` (freejoint adds 7), `distance_before_cm` ~96 → `distance_after_cm` ~16, cube z unchanged | cube flew away → check `freejoint` / timestep |
 | `panda_ik_teleport.py` | PNG: cube **through** the hand; prints `ik_err_cm 0.0` then **`GRASP_OK`** | if the PNG looks clean, you are not on this pitfall |
 | `panda_ik_collide.py` | `CONTACT` then **`GRASP_FAIL`** on this hardware | `GRASP_OK` here means you likely teleported again |
+| `panda_ik_6d.py` | `PINCH` then **`GRASP_OK`**, PNG: cube **in** the fingers off the floor, `ncon_cube>0` | `GRASP_OK` with `ncon=0` is pitfall #6 (toss) |
 
-A green `GRASP_OK` from the teleport script is **not** this section’s pass.
+A green `GRASP_OK` from the teleport script is **not** this section’s pass. A green `GRASP_OK` from `panda_ik_6d.py` still needs the lift PNG and a non-zero cube↔finger contact count.
 
 ---
 
@@ -130,7 +151,9 @@ A green `GRASP_OK` from the teleport script is **not** this section’s pass.
 | `joint1` PNG unchanged | Side camera | Move `joint2`, or change azimuth |
 | Cube through the hand, `GRASP_OK` | `qpos` snap + `mj_forward` | Descend with `mj_step` |
 | `ncon>0` at rest | Cube on the floor | Exclude `floor` geom |
-| Contact then cube stays down | Position-only IK, palm hit | 6-D grasp IK (not verified here) |
+| Contact then cube stays down | Position-only IK, palm hit | 6-D IK on `hand`, pad TCP |
+| `GRASP_OK` but empty gripper in the PNG | Fingers commanded to 0, cube tossed | Freeze grip after both pads contact |
+| Pads on the −X rim, cube levers out | TCP at cube centre + IK residual | Aim TCP 1 cm further in +X |
 | CUDA OOM / tiny `MemAvailable` | ~100 GB LLM still resident | Idle profile ([boot profiles](https://github.com/AI-Architect-Lab-333/dgx-spark-idle-llm-profiles)) |
 | `bash^M` / odd `NameError` after scp from Windows | CRLF | `sed -i 's/\r$//'` on the box |
 
@@ -138,7 +161,8 @@ A green `GRASP_OK` from the teleport script is **not** this section’s pass.
 
 ## Known limitations
 
-- **No collision-aware successful pinch** on this box. The verified grasp-shaped success used the teleport pitfall. The collision script’s verified result is **`GRASP_FAIL`**.
+- **Collision-aware pinch is verified** (`panda_ik_6d.py`, two identical runs). The teleport script’s `GRASP_OK` remains a pitfall. The older collide script’s verified result is still **`GRASP_FAIL`** (position-only).
+- **The cube can still drift ~2 cm in XY during the lift** while staying in the fingers. This is a pinch, not a weld.
 - **No interactive viewer.** Headless EGL PNGs only. Livestream / Isaac Sim GUI is a different stack.
 - **MJX / Warp.** JAX GPU was probed; Warp was not installed. No batched RL training in this guide.
 - **Isaac Sim** exists for GB10 aarch64 (NVIDIA docs, Isaac 6 / DGX OS 7) but was **not** installed here. Driver pin (docs: 580.159.03; this box ran **580.173.02**) was not re-tested with Isaac.
@@ -152,4 +176,4 @@ A green `GRASP_OK` from the teleport script is **not** this section’s pass.
 MuJoCo is open source ([google-deepmind/mujoco](https://github.com/google-deepmind/mujoco)). Robot XML from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Franka Emika Panda). Differential IK: [mink](https://github.com/kevinzakka/mink). The teleport-vs-`mj_step` failure mode and the side-camera `joint1` miss are specific to this session.
 
 ---
-*Guide written and verified in August 2026 on an NVIDIA DGX Spark (GB10) (121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12.3, MuJoCo 3.12.0, mink 1.3.0, NVIDIA driver 580.173.02). EGL PNGs only. Collision-aware pinch: GRASP_FAIL. Teleport IK: cube through the hand.*
+*Guide written and verified in August–September 2026 on an NVIDIA DGX Spark (GB10) (121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12.3, MuJoCo 3.12.0, mink 1.3.0, NVIDIA driver 580.173.02). EGL PNGs only. Collision-aware 6-D pinch: GRASP_OK (two runs). Teleport IK: cube through the hand. Position-only collide: GRASP_FAIL.*
