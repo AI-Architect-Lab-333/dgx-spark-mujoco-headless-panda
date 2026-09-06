@@ -153,6 +153,10 @@ Then `pip install warp-lang mujoco-warp` (wheels: `warp_lang-1.17.0-py3-none-man
 
 Warp first compile ~18 s; later `nworld` values reuse kernels (~4 ms). At 1024 worlds Warp already beats both 1× CPU and MJX-4096.
 
+![MJX vs Warp vs one CPU Panda, log–log env-steps/s against N](images/mjx-warp-throughput.png)
+
+The figure is plotted from those prints (`plot_mjx_warp.py`); it does not re-run the GPU. The dashed line is the 1× CPU rate. MJX crosses it at **N=2048**; Warp at **N=1024**.
+
 ### Pitfall #8 — one GPU env is not “the GPU is faster”
 
 Symptom: `mjx_batch 1` prints ~128 steps/s next to a CPU one-env run at ~217 k. Cause: XLA launch overhead; MJX pays off when **many** worlds share one kernel. Correction: report **env-steps/s** (`N × steps / wall`) and find the crossover (here **2048** for MJX, **1024** for Warp). Do not quote the single-env MJX figure as a training rate.
