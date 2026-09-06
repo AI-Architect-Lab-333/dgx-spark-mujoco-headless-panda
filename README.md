@@ -2,7 +2,7 @@
 
 **The problem this guide solves**: you have a headless NVIDIA DGX Spark (no usable display), the GPU is free, and you want a robot **inside a physics engine** (contacts, gravity) — not a GUI puppet, not a screenshot from a laptop, and not a hardware arm. This guide documents a **verified working** configuration (NVIDIA DGX Spark (GB10), 121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12, MuJoCo 3.12.0, mink 1.3.0, August–September 2026): MuJoCo runs with `MUJOCO_GL=egl`, writes PNGs, drives a Menagerie Franka Panda, and approaches a cube.
 
-It covers why a **side camera hides `joint1`**, why **`mj_forward` after IK** lets the cube occupy the same volume as the hand (the PNG still “grasps”), why **floor contacts are not a grasp**, why **position-only IK** on `left_finger` hits the palm, and why a **6-D pinch** that then commands the gripper to 0 **tosses** the cube (a green `GRASP_OK` with `ncon=0`).
+It covers why a **side camera hides `joint1`**, why **`mj_forward` after IK** lets the cube occupy the same volume as the hand (the PNG still “grasps”), why **floor contacts are not a grasp**, why **position-only IK** on `left_finger` hits the palm, why a **6-D pinch** that then commands the gripper to 0 **tosses** the cube (a green `GRASP_OK` with `ncon=0`), and why **one MJX env on the GPU is slower than CPU** until the batch is thousands of Pandas.
 
 **Where this fits**: this is GPU-side work on the Spark, not another inference service. It needs the [idle vs LLM boot profiles](https://github.com/AI-Architect-Lab-333/dgx-spark-idle-llm-profiles) first. The inference series is [headless setup](https://github.com/AI-Architect-Lab-333/dgx-spark-headless-setup) → [cross-host inference](https://github.com/AI-Architect-Lab-333/dgx-spark-cross-host-inference) → [Qwen3-VL beside that LLM](https://github.com/AI-Architect-Lab-333/dgx-spark-vl-beside-llm).
 
@@ -37,7 +37,7 @@ Symptom: `Renderer` raises or you get a GLFW/display error. Cause: default GL wa
 
 ### Pitfall #2 — `from mujoco import mjx` with only `pip install mujoco`
 
-Symptom: `ImportError: cannot import name 'mjx'`. Cause: MJX is the extra package `mujoco-mjx`. Correction: `pip install mujoco-mjx jax[cuda12]` if you want the JAX path. On this GB10, `jax 0.11.1` reported `backend gpu` / `CudaDevice(id=0)`. A **single** Panda env on MJX ran at **128** steps/s after a 6.5 s JIT — slower than CPU for one robot; MJX is for **batches**. `warp` was **not** installed (`No module named 'warp'`).
+Symptom: `ImportError: cannot import name 'mjx'`. Cause: MJX is the extra package `mujoco-mjx`. Correction: `pip install mujoco-mjx jax[cuda12]` if you want the JAX path. On this GB10, `jax 0.11.1` reported `backend gpu` / `CudaDevice(id=0)`. A **single** Panda env on MJX ran at **128** steps/s after a ~7 s JIT — slower than CPU for one robot; MJX is for **batches** (next section). `warp-lang` 1.17.0 and `mujoco-warp` 3.12.0 **did** install on aarch64 (September 2026).
 
 ---
 
@@ -124,7 +124,46 @@ Symptom: the first 6-D run printed **`GRASP_OK`** with `ncon_cube=0` and `tcp_to
 
 Symptom: pads sat at world `x≈0.442` while the cube centre is `0.45`; lift slipped even with a two-finger contact. Cause: ~4 mm IK residual plus a TCP aimed at the geometric centre, so the pads gripped the **−X** rim. Correction: aim the TCP at `cube + (0.01, 0, 0)`.
 
-## 6. End-to-end verification
+## 6. Batched MJX and Warp: when the GPU finally beats one CPU Panda
+
+Menagerie’s `mjx_scene.xml` (nq=9). Idle GPU. CPU `mj_step` on **that same XML**, 20 000 steps: **216 889** steps/s. Then `jax.vmap(mjx.step)` over N copies (`mjx_batch.py`), 200 steps after JIT:
+
+| N envs | MJX env-steps/s | vs 1× CPU |
+|---|---|---|
+| 1 | 128 | 0.00× |
+| 8 | 1 008 | 0.00× |
+| 32 | 4 044 | 0.02× |
+| 128 | 15 538 | 0.07× |
+| 512 | 61 332 | 0.28× |
+| 1 024 | 120 475 | 0.56× |
+| 2 048 | 229 959 | **1.06×** |
+| 4 096 | 414 479 | **1.91×** |
+
+JIT ~7–8 s **per** batch size. Per-env rate stays ~100–128 steps/s; throughput scales with N. MJX **beats one CPU Panda only at N ≥ 2048** on this box.
+
+Then `pip install warp-lang mujoco-warp` (wheels: `warp_lang-1.17.0-py3-none-manylinux_2_34_aarch64`, `mujoco-warp-3.12.0`). Warp init: **NVIDIA GB10**, sm_121, 122 Gi, CUDA toolkit 12.9 / driver 13.0. Same scene, `mjw.put_data(..., nworld=N)` (`mjwarp_batch.py`):
+
+| N envs | Warp env-steps/s | vs 1× CPU |
+|---|---|---|
+| 1 | 406 | 0.00× |
+| 128 | 51 653 | 0.24× |
+| 1 024 | 405 138 | **1.87×** |
+| 2 048 | 791 236 | **3.65×** |
+| 4 096 | 1 477 179 | **6.81×** |
+
+Warp first compile ~18 s; later `nworld` values reuse kernels (~4 ms). At 1024 worlds Warp already beats both 1× CPU and MJX-4096.
+
+### Pitfall #8 — one GPU env is not “the GPU is faster”
+
+Symptom: `mjx_batch 1` prints ~128 steps/s next to a CPU one-env run at ~217 k. Cause: XLA launch overhead; MJX pays off when **many** worlds share one kernel. Correction: report **env-steps/s** (`N × steps / wall`) and find the crossover (here **2048** for MJX, **1024** for Warp). Do not quote the single-env MJX figure as a training rate.
+
+### Pitfall #9 — `No module named 'warp'` after `import mjx`
+
+Symptom: MJX loads; `import warp` fails. Cause: `mujoco-mjx` ships an `mjx.warp` **stub**; the CUDA runtime is `warp-lang`. Correction: `pip install warp-lang mujoco-warp`. Verified aarch64 wheels on this GB10.
+
+Warp also printed `linesearch iterations limit reached - please increase ls_iterations to 8` on this Panda scene. The step still returned timings; that warning is part of the record, not a silent pass.
+
+## 7. End-to-end verification
 
 Run on the GPU box with the LLM **unloaded**, `MUJOCO_GL=egl`. Copy `panda-cube.xml` next to Menagerie’s `scene.xml`.
 
@@ -137,6 +176,8 @@ Run on the GPU box with the LLM **unloaded**, `MUJOCO_GL=egl`. Copy `panda-cube.
 | `panda_ik_teleport.py` | PNG: cube **through** the hand; prints `ik_err_cm 0.0` then **`GRASP_OK`** | if the PNG looks clean, you are not on this pitfall |
 | `panda_ik_collide.py` | `CONTACT` then **`GRASP_FAIL`** on this hardware | `GRASP_OK` here means you likely teleported again |
 | `panda_ik_6d.py` | `PINCH` then **`GRASP_OK`**, PNG: cube **in** the fingers off the floor, `ncon_cube>0` | `GRASP_OK` with `ncon=0` is pitfall #6 (toss) |
+| `mjx_batch.py` | `MJX_BEATS_CPU` at N=2048 or 4096; N=1 stays ~128 steps/s | quoting N=1 as “GPU training speed” → pitfall #8 |
+| `mjwarp_batch.py` | Warp init GB10; 1024 worlds **faster** than 1× CPU | `No module named 'warp'` → pitfall #9 |
 
 A green `GRASP_OK` from the teleport script is **not** this section’s pass. A green `GRASP_OK` from `panda_ik_6d.py` still needs the lift PNG and a non-zero cube↔finger contact count.
 
@@ -155,6 +196,8 @@ A green `GRASP_OK` from the teleport script is **not** this section’s pass. A 
 | `GRASP_OK` but empty gripper in the PNG | Fingers commanded to 0, cube tossed | Freeze grip after both pads contact |
 | Pads on the −X rim, cube levers out | TCP at cube centre + IK residual | Aim TCP 1 cm further in +X |
 | CUDA OOM / tiny `MemAvailable` | ~100 GB LLM still resident | Idle profile ([boot profiles](https://github.com/AI-Architect-Lab-333/dgx-spark-idle-llm-profiles)) |
+| One MJX env ~128 steps/s, “GPU is slow” | Launch overhead, N=1 | Batch ≥2048; quote env-steps/s |
+| `No module named 'warp'` | Stub vs `warp-lang` | `pip install warp-lang mujoco-warp` |
 | `bash^M` / odd `NameError` after scp from Windows | CRLF | `sed -i 's/\r$//'` on the box |
 
 ---
@@ -164,7 +207,7 @@ A green `GRASP_OK` from the teleport script is **not** this section’s pass. A 
 - **Collision-aware pinch is verified** (`panda_ik_6d.py`, two identical runs). The teleport script’s `GRASP_OK` remains a pitfall. The older collide script’s verified result is still **`GRASP_FAIL`** (position-only).
 - **The cube can still drift ~2 cm in XY during the lift** while staying in the fingers. This is a pinch, not a weld.
 - **No interactive viewer.** Headless EGL PNGs only. Livestream / Isaac Sim GUI is a different stack.
-- **MJX / Warp.** JAX GPU was probed; Warp was not installed. No batched RL training in this guide.
+- **MJX / Warp throughput is verified** (`mjx_batch.py`, `mjwarp_batch.py`) on `mjx_scene.xml`. That is **not** a trained policy: no rewards, no PPO, no Isaac Lab. Warp printed a linesearch warning on this Panda.
 - **Isaac Sim** exists for GB10 aarch64 (NVIDIA docs, Isaac 6 / DGX OS 7) but was **not** installed here. Driver pin (docs: 580.159.03; this box ran **580.173.02**) was not re-tested with Isaac.
 - **No physical robot.** USB desktop arms and real Franka hardware are out of scope.
 - Scripts assume Menagerie paths under `$HOME/inference/mujoco_menagerie` and write `$HOME/inference/mujoco-out`.
@@ -176,4 +219,4 @@ A green `GRASP_OK` from the teleport script is **not** this section’s pass. A 
 MuJoCo is open source ([google-deepmind/mujoco](https://github.com/google-deepmind/mujoco)). Robot XML from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Franka Emika Panda). Differential IK: [mink](https://github.com/kevinzakka/mink). The teleport-vs-`mj_step` failure mode and the side-camera `joint1` miss are specific to this session.
 
 ---
-*Guide written and verified in August–September 2026 on an NVIDIA DGX Spark (GB10) (121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12.3, MuJoCo 3.12.0, mink 1.3.0, NVIDIA driver 580.173.02). EGL PNGs only. Collision-aware 6-D pinch: GRASP_OK (two runs). Teleport IK: cube through the hand. Position-only collide: GRASP_FAIL.*
+*Guide written and verified in August–September 2026 on an NVIDIA DGX Spark (GB10) (121 Gi unified memory, Ubuntu 24.04 / DGX OS, Python 3.12.3, MuJoCo 3.12.0, mink 1.3.0, JAX 0.11.1, warp-lang 1.17.0, mujoco-warp 3.12.0). EGL PNGs only. Collision-aware 6-D pinch: GRASP_OK (two runs). MJX beats 1× CPU at 2048 Pandas; Warp at 1024. Teleport IK: cube through the hand. Position-only collide: GRASP_FAIL.*
